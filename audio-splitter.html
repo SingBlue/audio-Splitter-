@@ -1,0 +1,282 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Auto Audio Splitter</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/lamejs/1.2.1/lame.min.js"></script>
+<style>
+  :root{--bg:#f6f7f9;--card:#fff;--ink:#1d2330;--mute:#6b7385;--acc:#2f6fed;--line:#e1e5ec;--cut:#e5484d}
+  @media(prefers-color-scheme:dark){:root{--bg:#12151b;--card:#1b2029;--ink:#e8ebf2;--mute:#97a0b3;--line:#2a3140}}
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.4 system-ui,sans-serif}
+  main{max-width:820px;margin:0 auto;padding:16px}
+  h1{font-size:1.4rem;margin:8px 0 14px}
+  .card{background:var(--card);border:1px solid var(--line);border-radius:12px;padding:14px;margin-bottom:12px}
+  #drop{border:2px dashed var(--line);text-align:center;padding:28px 12px;cursor:pointer;color:var(--mute)}
+  #drop.over{border-color:var(--acc)}
+  .row{display:flex;gap:10px;flex-wrap:wrap;align-items:end}
+  label{display:flex;flex-direction:column;font-size:.8rem;color:var(--mute);gap:4px}
+  input,select{font:inherit;padding:8px;border-radius:8px;border:1px solid var(--line);background:var(--bg);color:var(--ink)}
+  input[type=number]{width:90px}
+  button{font:inherit;padding:9px 14px;border-radius:8px;border:0;background:var(--acc);color:#fff;cursor:pointer}
+  button.sec{background:var(--bg);color:var(--ink);border:1px solid var(--line)}
+  button:disabled{opacity:.5;cursor:default}
+  canvas{width:100%;height:140px;display:block;touch-action:none;border-radius:8px;background:var(--bg)}
+  .hint{color:var(--mute);font-size:.85rem;margin:6px 0 0}
+  .seg{display:flex;align-items:center;gap:10px;padding:8px 0;border-top:1px solid var(--line)}
+  .seg:first-child{border-top:0}
+  .seg b{width:2rem}.seg span{flex:1;color:var(--mute);font-variant-numeric:tabular-nums}
+  progress{width:100%;height:10px}
+  .hidden{display:none}
+</style>
+</head>
+<body>
+<main>
+  <h1>Auto Audio Splitter</h1>
+
+  <div class="card" id="drop">Tap or drop an audio file here<input id="file" type="file" accept="audio/*,video/*" class="hidden"></div>
+
+  <div id="work" class="hidden">
+    <div class="card">
+      <div class="row">
+        <label>Split by
+          <select id="mode">
+            <option value="equal">Equal pieces</option>
+            <option value="length">Target length</option>
+            <option value="topic">Topic changes (longest pauses)</option>
+          </select></label>
+        <label id="nL">Pieces<input id="n" type="number" min="2" max="50" value="3"></label>
+        <label id="lenL" class="hidden">Minutes per piece<input id="len" type="number" min="1" value="20"></label>
+        <label id="winL">Look for a pause within ± (% of piece)
+          <input id="win" type="number" min="1" max="50" value="12"></label>
+        <button id="find">Find best cuts</button>
+      </div>
+      <p class="hint" id="info"></p>
+    </div>
+
+    <div class="card">
+      <canvas id="wave"></canvas>
+      <p class="hint">Red lines are the cuts. Drag one to adjust it manually. Double-click the waveform to add a cut; double-click a cut to remove it.</p>
+    </div>
+
+    <div class="card">
+      <div id="segs"></div>
+    </div>
+
+    <div class="card">
+      <div class="row">
+        <label>Name<input id="name" type="text" value="Lecture"></label>
+        <label>Format<select id="fmt"><option value="mp3">MP3 (small)</option><option value="wav">WAV (lossless, large)</option></select></label>
+        <label>Quality<select id="kbps"><option>64</option><option selected>128</option><option>192</option></select></label>
+        <button id="dl">Download all (ZIP)</button>
+      </div>
+      <div class="row" style="margin-top:10px">
+        <label style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" id="trim"> Trim silence at start/end of each piece</label>
+        <label style="flex-direction:row;align-items:center;gap:6px"><input type="checkbox" id="norm"> Normalize volume</label>
+      </div>
+      <p class="hint">Files are numbered 01, 02, 03… and packed in a folder inside the ZIP.</p>
+      <progress id="prog" value="0" max="1" class="hidden"></progress>
+    </div>
+  </div>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+let silThr = 0.002, buf = null, fileName = '', objUrl = null, cuts = [], rms = [], HOP = 0.02, audioEl = new Audio(), stopAt = null;
+
+// ---------- load ----------
+const drop = $('drop'), fileIn = $('file');
+drop.onclick = () => fileIn.click();
+drop.ondragover = e => { e.preventDefault(); drop.classList.add('over'); };
+drop.ondragleave = () => drop.classList.remove('over');
+drop.ondrop = e => { e.preventDefault(); drop.classList.remove('over'); if (e.dataTransfer.files[0]) load(e.dataTransfer.files[0]); };
+fileIn.onchange = () => fileIn.files[0] && load(fileIn.files[0]);
+
+async function load(f) {
+  drop.textContent = 'Reading ' + f.name + '…';
+  try {
+    const ctx = new (window.AudioContext || window.webkitAudioContext)();
+    buf = await ctx.decodeAudioData(await f.arrayBuffer());
+    ctx.close();
+  } catch (e) { drop.textContent = 'Could not read that file. Try MP3, WAV, M4A or MP4.'; return; }
+  fileName = f.name.replace(/\.[^.]+$/, '');
+  $('name').value = fileName;
+  if (objUrl) URL.revokeObjectURL(objUrl);
+  objUrl = URL.createObjectURL(f); audioEl.src = objUrl;
+  drop.textContent = f.name + ' — tap to choose another';
+  $('work').classList.remove('hidden');
+  analyse();
+  findCuts();
+}
+
+// ---------- analysis ----------
+function analyse() {
+  const ch = buf.numberOfChannels, sr = buf.sampleRate, hop = Math.floor(sr * HOP);
+  const frames = Math.floor(buf.length / hop); rms = new Float32Array(frames);
+  const data = [...Array(ch)].map((_, i) => buf.getChannelData(i));
+  for (let f = 0; f < frames; f++) {
+    let s = 0; const a = f * hop;
+    for (let c = 0; c < ch; c++) { const d = data[c]; for (let i = a; i < a + hop; i += 4) s += d[i] * d[i]; }
+    rms[f] = Math.sqrt(s / (ch * hop / 4));
+  }
+}
+
+function pauses() {
+  const sorted = Float32Array.from(rms).sort();
+  const thr = Math.max(sorted[Math.floor(sorted.length * 0.2)] * 1.5, 0.0015); silThr = thr;
+  const out = []; let start = -1;
+  for (let i = 0; i <= rms.length; i++) {
+    const quiet = i < rms.length && rms[i] < thr;
+    if (quiet && start < 0) start = i;
+    if (!quiet && start >= 0) {
+      const len = (i - start) * HOP;
+      if (len >= 0.25) out.push({ mid: (start + i) / 2 * HOP, len });
+      start = -1;
+    }
+  }
+  return out;
+}
+
+function findCuts() {
+  const mode = $('mode').value, D = buf.duration;
+  let n = Math.max(2, Math.min(50, +$('n').value || 3));
+  if (mode === 'length') n = Math.max(2, Math.min(200, Math.round(D / (Math.max(1, +$('len').value || 20) * 60))));
+  const ps = pauses();
+  if (mode === 'topic') {
+    const minGap = D / (n * 3), chosen = [];
+    [...ps].filter(p => p.len >= 0.6).sort((a, b) => b.len - a.len).forEach(p => {
+      if (chosen.length < n - 1 && chosen.every(c => Math.abs(c - p.mid) >= minGap)) chosen.push(p.mid);
+    });
+    cuts = chosen.sort((a, b) => a - b);
+    $('info').textContent = `Length ${fmt(D)}. Cut at the ${cuts.length} longest pauses (likely topic changes)` + (cuts.length < n - 1 ? ` — only ${cuts.length} clear ones found, so you get ${cuts.length + 1} pieces.` : '.');
+    render(); return;
+  }
+  const piece = D / n, w = piece * (Math.max(1, +$('win').value || 12) / 100);
+  cuts = []; let exact = 0;
+  for (let i = 1; i < n; i++) {
+    const target = i * piece;
+    let best = null, bs = -1e9;
+    for (const p of ps) {
+      const d = Math.abs(p.mid - target); if (d > w) continue;
+      const s = Math.min(p.len, 3) - 1.5 * d / w;
+      if (s > bs) { bs = s; best = p.mid; }
+    }
+    if (best === null) { // fallback: quietest spot in window
+      let lo = Math.floor((target - w) / HOP), hi = Math.floor((target + w) / HOP), m = 1e9;
+      best = target;
+      for (let f = Math.max(0, lo); f < Math.min(rms.length, hi); f++) if (rms[f] < m) { m = rms[f]; best = f * HOP; }
+    } else exact++;
+    cuts.push(best);
+  }
+  cuts.sort((a, b) => a - b);
+  $('info').textContent = `Length ${fmt(D)}. ${exact} of ${n - 1} cuts landed on a real pause.`;
+  render();
+}
+$('find').onclick = findCuts;
+$('mode').onchange = () => {
+  const m = $('mode').value;
+  $('nL').classList.toggle('hidden', m === 'length');
+  $('lenL').classList.toggle('hidden', m !== 'length');
+  $('winL').classList.toggle('hidden', m === 'topic');
+  findCuts();
+};
+
+// ---------- drawing & editing ----------
+const cv = $('wave'); let peaks = null, W = 0, H = 0;
+function computePeaks() {
+  const dpr = window.devicePixelRatio || 1;
+  W = cv.clientWidth * dpr; H = cv.clientHeight * dpr; cv.width = W; cv.height = H;
+  const d = buf.getChannelData(0), step = d.length / W; peaks = new Float32Array(W);
+  for (let x = 0; x < W; x++) { let m = 0; const a = Math.floor(x * step), b = Math.floor((x + 1) * step); for (let i = a; i < b; i += Math.max(1, ((b - a) / 40) | 0)) { const v = Math.abs(d[i]); if (v > m) m = v; } peaks[x] = m; }
+}
+function draw() {
+  if (!buf) return; if (!peaks || peaks.length !== cv.clientWidth * (window.devicePixelRatio || 1)) computePeaks();
+  const g = cv.getContext('2d'), css = getComputedStyle(document.body);
+  g.clearRect(0, 0, W, H); g.fillStyle = '#2f6fed';
+  for (let x = 0; x < W; x++) { const h = Math.max(1, peaks[x] * H * 0.95); g.fillRect(x, (H - h) / 2, 1, h); }
+  g.strokeStyle = '#e5484d'; g.lineWidth = 2 * (window.devicePixelRatio || 1); g.fillStyle = '#e5484d'; g.font = `${12 * (window.devicePixelRatio || 1)}px system-ui`;
+  cuts.forEach(c => { const x = c / buf.duration * W; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke(); });
+}
+function render() {
+  draw();
+  const pts = [0, ...cuts, buf.duration], box = $('segs'); box.innerHTML = '';
+  for (let i = 0; i < pts.length - 1; i++) {
+    const d = document.createElement('div'); d.className = 'seg';
+    d.innerHTML = `<b>${String(i + 1).padStart(2, '0')}</b><span>${fmt(pts[i])} – ${fmt(pts[i + 1])} (${fmt(pts[i + 1] - pts[i])})</span><button class="sec">▶ Play</button><button class="sec">Last 5s</button>`;
+    const [b1, b2] = d.querySelectorAll('button');
+    b1.onclick = () => play(pts[i], pts[i + 1]);
+    b2.onclick = () => play(Math.max(pts[i], pts[i + 1] - 5), pts[i + 1]);
+    box.appendChild(d);
+  }
+}
+function play(a, b) { audioEl.currentTime = a; stopAt = b; audioEl.play(); }
+audioEl.ontimeupdate = () => { if (stopAt && audioEl.currentTime >= stopAt) { audioEl.pause(); stopAt = null; } };
+
+let drag = -1;
+const tx = e => { const r = cv.getBoundingClientRect(); return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)) * buf.duration; };
+const near = e => { const t = tx(e), tol = buf.duration * 10 / cv.clientWidth; let k = -1, m = tol; cuts.forEach((c, i) => { if (Math.abs(c - t) < m) { m = Math.abs(c - t); k = i; } }); return k; };
+cv.onpointerdown = e => { drag = near(e); if (drag >= 0) cv.setPointerCapture(e.pointerId); };
+cv.onpointermove = e => { if (drag < 0) return; cuts[drag] = tx(e); draw(); };
+cv.onpointerup = () => { if (drag >= 0) { cuts.sort((a, b) => a - b); drag = -1; render(); } };
+cv.ondblclick = e => { const k = near(e); if (k >= 0) { if (cuts.length > 1) cuts.splice(k, 1); } else cuts.push(tx(e)); cuts.sort((a, b) => a - b); render(); };
+addEventListener('resize', () => { peaks = null; draw(); });
+
+// ---------- export ----------
+const pad = n => String(n).padStart(2, '0');
+function fmt(s) { s = Math.round(s); const h = (s / 3600) | 0, m = ((s % 3600) / 60) | 0; return (h ? h + ':' + pad(m) : m) + ':' + pad(s % 60); }
+const tick = () => new Promise(r => setTimeout(r, 0));
+
+function wavBlob(chs, sr) {
+  const n = chs[0].length, c = chs.length, out = new DataView(new ArrayBuffer(44 + n * c * 2));
+  const w = (o, s) => [...s].forEach((ch, i) => out.setUint8(o + i, ch.charCodeAt(0)));
+  w(0, 'RIFF'); out.setUint32(4, 36 + n * c * 2, true); w(8, 'WAVEfmt '); out.setUint32(16, 16, true); out.setUint16(20, 1, true);
+  out.setUint16(22, c, true); out.setUint32(24, sr, true); out.setUint32(28, sr * c * 2, true); out.setUint16(32, c * 2, true); out.setUint16(34, 16, true);
+  w(36, 'data'); out.setUint32(40, n * c * 2, true);
+  let o = 44; for (let i = 0; i < n; i++) for (let k = 0; k < c; k++) { const v = Math.max(-1, Math.min(1, chs[k][i])); out.setInt16(o, v < 0 ? v * 0x8000 : v * 0x7fff, true); o += 2; }
+  return new Blob([out], { type: 'audio/wav' });
+}
+async function mp3Blob(chs, sr, kbps, onp) {
+  const c = Math.min(2, chs.length), enc = new lamejs.Mp3Encoder(c, sr, kbps), parts = [], B = 1152 * 10, n = chs[0].length;
+  const toI = a => { const o = new Int16Array(a.length); for (let i = 0; i < a.length; i++) { const v = Math.max(-1, Math.min(1, a[i])); o[i] = v < 0 ? v * 0x8000 : v * 0x7fff; } return o; };
+  for (let i = 0; i < n; i += B) {
+    const l = toI(chs[0].subarray(i, i + B)), r = c > 1 ? toI(chs[1].subarray(i, i + B)) : null;
+    const d = c > 1 ? enc.encodeBuffer(l, r) : enc.encodeBuffer(l); if (d.length) parts.push(d);
+    if ((i / B) % 40 === 0) { onp(i / n); await tick(); }
+  }
+  const f = enc.flush(); if (f.length) parts.push(f);
+  return new Blob(parts, { type: 'audio/mpeg' });
+}
+
+$('dl').onclick = async () => {
+  const btn = $('dl'), prog = $('prog'); btn.disabled = true; prog.classList.remove('hidden');
+  try {
+    const type = $('fmt').value, kbps = +$('kbps').value, sr = buf.sampleRate, name = ($('name').value || 'Audio').trim();
+    const pts = [0, ...cuts, buf.duration], N = pts.length - 1, zip = new JSZip(), dir = zip.folder(name);
+    if (type === 'mp3' && typeof lamejs === 'undefined') throw new Error('MP3 encoder failed to load (check internet). Try WAV.');
+    for (let i = 0; i < N; i++) {
+      let a = Math.floor(pts[i] * sr), b = Math.floor(pts[i + 1] * sr);
+      if ($('trim').checked) {
+        const f0 = Math.floor(pts[i] / HOP), f1 = Math.min(rms.length, Math.floor(pts[i + 1] / HOP)), pd = Math.round(0.2 / HOP);
+        let s = f0; while (s < f1 && rms[s] < silThr) s++;
+        let e = f1 - 1; while (e > s && rms[e] < silThr) e--;
+        if (e > s) { a = Math.max(a, Math.floor((s - pd) * HOP * sr)); b = Math.min(b, Math.floor((e + 1 + pd) * HOP * sr)); }
+      }
+      let chs = [...Array(buf.numberOfChannels)].map((_, k) => buf.getChannelData(k).subarray(a, b));
+      if ($('norm').checked) {
+        let pk = 0; chs.forEach(c => { for (let j = 0; j < c.length; j += 2) { const v = Math.abs(c[j]); if (v > pk) pk = v; } });
+        const g = Math.min(10, 0.97 / Math.max(pk, 1e-4));
+        chs = chs.map(c => { const o = new Float32Array(c.length); for (let j = 0; j < c.length; j++) o[j] = c[j] * g; return o; });
+      }
+      const blob = type === 'wav' ? wavBlob(chs, sr) : await mp3Blob(chs, sr, kbps, p => prog.value = (i + p) / N);
+      dir.file(`${pad(i + 1)} - ${name}.${type}`, blob); prog.value = (i + 1) / N; await tick();
+    }
+    const out = await zip.generateAsync({ type: 'blob', compression: 'STORE' });
+    const a = document.createElement('a'); a.href = URL.createObjectURL(out); a.download = name + '.zip'; a.click();
+  } catch (e) { alert(e.message); }
+  btn.disabled = false; prog.classList.add('hidden');
+};
+</script>
+</body>
+</html>
