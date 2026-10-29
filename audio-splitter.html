@@ -34,7 +34,7 @@
 </head>
 <body>
 <main>
-  <h1>Auto Audio Splitter</h1>
+  <h1>Auto Audio Splitter <small id="ver" style="font-size:.75rem;font-weight:400;color:var(--mute)">v1.4 · 29 Oct 2026</small></h1>
 
   <div class="card" id="drop">Tap or drop an audio file here<input id="file" type="file" accept="audio/*,video/*" class="hidden"></div>
 
@@ -58,10 +58,18 @@
 
     <div class="card">
       <canvas id="wave"></canvas>
-      <p class="hint">Red lines are the cuts. Drag one to adjust it manually. Double-click the waveform to add a cut; double-click a cut to remove it.</p>
+      <input id="pan" type="range" min="0" max="1000" value="0" style="width:100%;margin-top:8px" disabled>
+      <div class="row" style="margin-top:8px">
+        <button class="sec" id="zin">＋ Zoom in</button>
+        <button class="sec" id="zout">－ Zoom out</button>
+        <button class="sec" id="zfit">Fit all</button>
+        <button class="sec" id="tall">Taller</button>
+      </div>
+      <p class="hint">Red lines are the cuts. Drag one to adjust it. Pinch (or use the buttons) to zoom, drag empty space or use the slider to scroll. Double-click the waveform to add a cut; double-click a cut to remove it.</p>
     </div>
 
     <div class="card">
+      <button class="sec" id="stop" style="position:sticky;top:8px;z-index:5;margin-bottom:6px">■ Stop playback</button>
       <div id="segs"></div>
     </div>
 
@@ -108,6 +116,7 @@ async function load(f) {
   drop.textContent = f.name + ' — tap to choose another';
   $('work').classList.remove('hidden');
   analyse();
+  setView(0, buf.duration);
   findCuts();
 }
 
@@ -184,20 +193,37 @@ $('mode').onchange = () => {
 };
 
 // ---------- drawing & editing ----------
-const cv = $('wave'); let peaks = null, W = 0, H = 0;
-function computePeaks() {
-  const dpr = window.devicePixelRatio || 1;
-  W = cv.clientWidth * dpr; H = cv.clientHeight * dpr; cv.width = W; cv.height = H;
-  const d = buf.getChannelData(0), step = d.length / W; peaks = new Float32Array(W);
-  for (let x = 0; x < W; x++) { let m = 0; const a = Math.floor(x * step), b = Math.floor((x + 1) * step); for (let i = a; i < b; i += Math.max(1, ((b - a) / 40) | 0)) { const v = Math.abs(d[i]); if (v > m) m = v; } peaks[x] = m; }
+const cv = $('wave'); let W = 0, H = 0, vs = 0, ve = 0; // visible window in seconds
+function setView(a, b) {
+  const D = buf.duration, span = Math.min(D, Math.max(Math.min(2, D), b - a));
+  vs = Math.max(0, Math.min(a, D - span)); ve = vs + span;
+  $('pan').value = D - span > 0 ? vs / (D - span) * 1000 : 0;
+  $('pan').disabled = span >= D - 0.01;
+}
+function zoom(f, c) {
+  c = c === undefined ? (vs + ve) / 2 : c;
+  const span = (ve - vs) * f, fr = (c - vs) / (ve - vs);
+  setView(c - fr * span, c + (1 - fr) * span); draw();
 }
 function draw() {
-  if (!buf) return; if (!peaks || peaks.length !== cv.clientWidth * (window.devicePixelRatio || 1)) computePeaks();
-  const g = cv.getContext('2d'), css = getComputedStyle(document.body);
+  if (!buf) return;
+  const dpr = window.devicePixelRatio || 1;
+  if (W !== Math.round(cv.clientWidth * dpr) || H !== Math.round(cv.clientHeight * dpr)) {
+    W = Math.round(cv.clientWidth * dpr); H = Math.round(cv.clientHeight * dpr); cv.width = W; cv.height = H;
+  }
+  const g = cv.getContext('2d'), d = buf.getChannelData(0), sr = buf.sampleRate, span = ve - vs, step = span * sr / W;
   g.clearRect(0, 0, W, H); g.fillStyle = '#2f6fed';
-  for (let x = 0; x < W; x++) { const h = Math.max(1, peaks[x] * H * 0.95); g.fillRect(x, (H - h) / 2, 1, h); }
-  g.strokeStyle = '#e5484d'; g.lineWidth = 2 * (window.devicePixelRatio || 1); g.fillStyle = '#e5484d'; g.font = `${12 * (window.devicePixelRatio || 1)}px system-ui`;
-  cuts.forEach(c => { const x = c / buf.duration * W; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke(); });
+  for (let x = 0; x < W; x++) {
+    const a = Math.floor(vs * sr + x * step), b = Math.min(d.length, Math.floor(vs * sr + (x + 1) * step));
+    let m = 0; const inc = Math.max(1, ((b - a) / 40) | 0);
+    for (let i = a; i < b; i += inc) { const v = Math.abs(d[i]); if (v > m) m = v; }
+    const h = Math.max(1, m * H * 0.95); g.fillRect(x, (H - h) / 2, 1, h);
+  }
+  g.strokeStyle = '#e5484d'; g.lineWidth = 2 * dpr;
+  cuts.forEach(c => { if (c < vs || c > ve) return; const x = (c - vs) / span * W; g.beginPath(); g.moveTo(x, 0); g.lineTo(x, H); g.stroke(); });
+  g.fillStyle = '#8a92a5'; g.font = `${11 * dpr}px system-ui`;
+  g.textAlign = 'left'; g.fillText(fmt(vs), 4 * dpr, 13 * dpr);
+  g.textAlign = 'right'; g.fillText(fmt(ve), W - 4 * dpr, 13 * dpr);
 }
 function render() {
   draw();
@@ -206,22 +232,52 @@ function render() {
     const d = document.createElement('div'); d.className = 'seg';
     d.innerHTML = `<b>${String(i + 1).padStart(2, '0')}</b><span>${fmt(pts[i])} – ${fmt(pts[i + 1])} (${fmt(pts[i + 1] - pts[i])})</span><button class="sec">▶ Play</button><button class="sec">Last 5s</button>`;
     const [b1, b2] = d.querySelectorAll('button');
-    b1.onclick = () => play(pts[i], pts[i + 1]);
+    b1.onclick = () => { if (!audioEl.paused) stopPlay(); else play(pts[i], pts[i + 1]); };
     b2.onclick = () => play(Math.max(pts[i], pts[i + 1] - 5), pts[i + 1]);
     box.appendChild(d);
   }
 }
 function play(a, b) { audioEl.currentTime = a; stopAt = b; audioEl.play(); }
+function stopPlay() { audioEl.pause(); stopAt = null; }
+$('stop').onclick = stopPlay;
 audioEl.ontimeupdate = () => { if (stopAt && audioEl.currentTime >= stopAt) { audioEl.pause(); stopAt = null; } };
 
-let drag = -1;
-const tx = e => { const r = cv.getBoundingClientRect(); return Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)) * buf.duration; };
-const near = e => { const t = tx(e), tol = buf.duration * 10 / cv.clientWidth; let k = -1, m = tol; cuts.forEach((c, i) => { if (Math.abs(c - t) < m) { m = Math.abs(c - t); k = i; } }); return k; };
-cv.onpointerdown = e => { drag = near(e); if (drag >= 0) cv.setPointerCapture(e.pointerId); };
-cv.onpointermove = e => { if (drag < 0) return; cuts[drag] = tx(e); draw(); };
-cv.onpointerup = () => { if (drag >= 0) { cuts.sort((a, b) => a - b); drag = -1; render(); } };
+let drag = -1, panning = null, pinch = null; const ptrs = new Map();
+const tx = e => { const r = cv.getBoundingClientRect(); return vs + Math.min(1, Math.max(0, (e.clientX - r.left) / r.width)) * (ve - vs); };
+const near = e => { const t = tx(e), tol = (ve - vs) * 14 / cv.clientWidth; let k = -1, m = tol; cuts.forEach((c, i) => { if (Math.abs(c - t) < m) { m = Math.abs(c - t); k = i; } }); return k; };
+cv.onpointerdown = e => {
+  cv.setPointerCapture(e.pointerId); ptrs.set(e.pointerId, e.clientX);
+  if (ptrs.size === 2) {
+    drag = -1; panning = null;
+    const [x1, x2] = [...ptrs.values()], r = cv.getBoundingClientRect();
+    const mid = vs + ((x1 + x2) / 2 - r.left) / r.width * (ve - vs);
+    pinch = { d: Math.max(20, Math.abs(x1 - x2)), vs, ve, mid }; return;
+  }
+  drag = near(e); if (drag < 0) panning = { x: e.clientX, vs, ve };
+};
+cv.onpointermove = e => {
+  if (ptrs.has(e.pointerId)) ptrs.set(e.pointerId, e.clientX);
+  if (ptrs.size === 2 && pinch) {
+    const [x1, x2] = [...ptrs.values()], span = (pinch.ve - pinch.vs) * pinch.d / Math.max(20, Math.abs(x1 - x2));
+    const fr = (pinch.mid - pinch.vs) / (pinch.ve - pinch.vs);
+    setView(pinch.mid - fr * span, pinch.mid + (1 - fr) * span); draw(); return;
+  }
+  if (drag >= 0) { cuts[drag] = tx(e); draw(); }
+  else if (panning) { const dx = (e.clientX - panning.x) / cv.clientWidth * (panning.ve - panning.vs); setView(panning.vs - dx, panning.ve - dx); draw(); }
+};
+cv.onpointerup = cv.onpointercancel = e => {
+  ptrs.delete(e.pointerId); if (ptrs.size < 2) pinch = null;
+  if (drag >= 0) { cuts.sort((a, b) => a - b); drag = -1; render(); }
+  panning = null;
+};
 cv.ondblclick = e => { const k = near(e); if (k >= 0) { if (cuts.length > 1) cuts.splice(k, 1); } else cuts.push(tx(e)); cuts.sort((a, b) => a - b); render(); };
-addEventListener('resize', () => { peaks = null; draw(); });
+cv.addEventListener('wheel', e => { e.preventDefault(); zoom(e.deltaY > 0 ? 1.25 : 0.8, tx(e)); }, { passive: false });
+$('zin').onclick = () => zoom(0.5);
+$('zout').onclick = () => zoom(2);
+$('zfit').onclick = () => { setView(0, buf.duration); draw(); };
+$('tall').onclick = () => { const big = cv.style.height !== '300px'; cv.style.height = big ? '300px' : ''; $('tall').textContent = big ? 'Shorter' : 'Taller'; draw(); };
+$('pan').oninput = () => { const span = ve - vs; setView($('pan').value / 1000 * (buf.duration - span), 0 + $('pan').value / 1000 * (buf.duration - span) + span); draw(); };
+addEventListener('resize', draw);
 
 // ---------- export ----------
 const pad = n => String(n).padStart(2, '0');
